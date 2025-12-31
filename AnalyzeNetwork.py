@@ -1,5 +1,5 @@
-#FIrst version  - guess who 00
 from scapy.all import *
+from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
 from mac_vendor_lookup import MacLookup
 
 OS_PING_LOADS = {
@@ -9,14 +9,16 @@ OS_PING_LOADS = {
     "FreeBSD": b" !\"#$%&'",
     "Solaris": b"\x00\x00\x00\x00\x00\x00\x00\x00"
 }
+
+
+
 class AnalyzeNetwork:
 
     def __device_info__(self, p):
         mac = self.__get_mac__(p)
         vendor = MacLookup().lookup(mac)
         ip = self.__get_ip__(p)
-        
-        dev_info = ({"MAC" : mac, "IP" : ip, "VENDOR" : vendor, "PACKETS" : [p]})
+        dev_info = ({"MAC" : mac, "IP" : ip, "VENDOR" : vendor, "PACKETS" : [p], "APP" : None, "SERVICE" : None, "ROLE" : None})
         dev_info["OS"] = self.guess_os(dev_info)
         return dev_info
 
@@ -26,7 +28,7 @@ class AnalyzeNetwork:
             if IP in p:
                 return p[IP].ttl
             return None
-    
+
 
     def __get_ip__(self, p):
         if ARP in p:
@@ -42,12 +44,14 @@ class AnalyzeNetwork:
         
         return None
 
+
     def __is_new_device__(self, mac, devices):
         for dev in devices:
             if mac == dev["MAC"]:
                 return dev
-        return True
-    
+        return None
+
+
     def __get_ping_payload__(self, device_info):
         for p in device_info["PACKETS"]:
             if p.haslayer(ICMP) and p[ICMP].type == 8 and p.haslayer(Raw):
@@ -55,6 +59,77 @@ class AnalyzeNetwork:
         return b""
 
 
+    def __get_app__(self, p):
+        if not p.haslayer(HTTPRequest):
+            return None
+            
+        ua_bytes = p[HTTPRequest].User_Agent
+        if not ua_bytes:
+            return None
+
+        ua_string = ua_bytes.decode(errors='ignore')
+        noise = {'mozilla', 'applewebkit', 'safari', 'gecko', 'khtml', 'mobile'}
+
+        labels = ua_string.split(" ")
+        candidate_apps = []
+
+        for label in labels:
+            clean_label = label.strip("(),;")
+            if "/" in clean_label:
+                name = clean_label.split("/")[0].lower()
+                if name not in noise:
+                    candidate_apps.append(clean_label)
+
+        if candidate_apps:
+            return candidate_apps[0]
+        
+        return labels[-1].strip("(),;") if labels else None
+
+
+    def __get_service__(self, p):
+        if not p.haslayer(HTTP) or p.haslayer(HTTPRequest):
+            return None
+        
+        server_bytes = p[HTTP].Server
+        if not server_bytes:
+            return None
+
+        server_string = server_bytes.decode()
+        labels = server_string.split(" ")
+        
+        if labels:
+            return labels[0].strip("(),;")
+
+        return None
+    
+    def __find_apps__(self):
+        for dev in self.devices:
+            for p in dev["PACKETS"]:
+                app = self.__get_app__(p)
+                if app is not None:
+                    dev["SERVICE"] = app
+                    dev["ROLE"] = "server"
+                    break
+    
+
+    def __find_services__(self):
+        for dev in self.devices:
+            for p in dev["PACKETS"]:
+                service = self.__get_service__(p)
+                if service is not None:
+                    dev["SERVICE"] = service
+                    dev["ROLE"] = "server"
+                    break
+
+
+    def __device_info__(self, p):
+        mac = self.__get_mac__(p)
+        vendor = MacLookup().lookup(mac)
+        ip = self.__get_ip__(p)
+        dev_info = ({"MAC" : mac, "IP" : ip, "VENDOR" : vendor, "PACKETS" : [p], "APP" : None, "SERVICE" : None, "ROLE" : None})
+        dev_info["OS"] = self.guess_os(dev_info)
+        return dev_info
+    
     def __init__(self, pcap_path):
         """
         pcap_path (string): path to a pcap file
@@ -63,12 +138,14 @@ class AnalyzeNetwork:
         devices = []
         for p in self.packets:
             dev_info = self.__device_info__(p)
-            if self.__is_new_device__(dev_info["MAC"], devices):
+            mac = dev_info["MAC"]
+
+            dev_found = self.__is_new_device__(mac, devices)
+            if dev_found is None:
                 devices.append(dev_info)
             else:
-                self.__is_new_device__(dev_info["MAC"], devices)["PACKETS"].append(p)
+                dev_found["PACKETS"].append(dev_info["PACKETS"][0])
         self.devices = devices
-
 
 
     def get_ips(self):
@@ -137,9 +214,12 @@ class AnalyzeNetwork:
     def get_info(self):
         """returns a list of dicts with information about every
         device in the pcap"""
+        self.__find_apps__()
+        self.__find_services__()
         ret = []
-        keys_to_add = ["MAC" ,"IP", "VENDOR", "OS"]
+        keys_to_add = ["MAC" ,"IP", "VENDOR", "OS", "APP", "SERVICE", "ROLE"]
         for dev in self.devices:
+            print(len(dev["PACKETS"]))
             info_to_add = {}
             for key in keys_to_add:
                 info_to_add[key] = dev[key]
